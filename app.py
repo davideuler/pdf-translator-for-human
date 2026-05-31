@@ -7,9 +7,13 @@ import pymupdf
 from deep_translator import (
     GoogleTranslator,
 )
-from deep_translator.openai_compatible import OpenAICompatibleTranslator
+from deep_translator.openai_compatible import (
+    OpenAICompatibleTranslator,
+    TranslationFailed,
+)
 import logging
 import argparse
+import translation_cache
 
 # Constants
 DEFAULT_PAGES_PER_LOAD = 2
@@ -146,6 +150,74 @@ def save_translation_cache(doc: pymupdf.Document, cache_key: str):
     cache_path = get_cache_dir() / cache_key
     doc.save(str(cache_path))  # 确保提供文件路径字符串
 
+def _translator_model_id(translator, translator_name: str) -> str:
+    """Stable identifier used as part of the block-cache key."""
+    model = getattr(translator, "model", "") or ""
+    return f"{translator_name}:{model}"
+
+
+def translate_blocks(texts, translator, translator_name: str, target_lang: str):
+    """Translate a list of block texts using the block-level cache and a
+    single batched LLM/Google call for the misses. Returns
+    (translated_texts, failed_count). Failed blocks keep their original text.
+    """
+    model_id = _translator_model_id(translator, translator_name)
+    source = getattr(translator, "_source", "auto")
+    target = target_lang
+
+    results = [None] * len(texts)
+    misses_idx = []
+    misses_text = []
+
+    for i, text in enumerate(texts):
+        if not text or not text.strip():
+            results[i] = text
+            continue
+        cached = translation_cache.get(
+            translator_name, source, target, model_id, text
+        )
+        if cached is not None:
+            results[i] = cached
+        else:
+            misses_idx.append(i)
+            misses_text.append(text)
+
+    failed = 0
+    if misses_text:
+        try:
+            if hasattr(translator, "translate_batch"):
+                translated = translator.translate_batch(misses_text)
+            else:
+                translated = [translator.translate(t) for t in misses_text]
+            for idx, text, out in zip(misses_idx, misses_text, translated):
+                out = str(out) if out is not None else text
+                results[idx] = out
+                translation_cache.put(
+                    translator_name, source, target, model_id, text, out
+                )
+        except TranslationFailed as exc:
+            logging.error("Batch translation failed: %s", exc)
+            # fall back per-block so partial success is still possible
+            for idx, text in zip(misses_idx, misses_text):
+                try:
+                    out = str(translator.translate(text))
+                    results[idx] = out
+                    translation_cache.put(
+                        translator_name, source, target, model_id, text, out
+                    )
+                except Exception as inner:
+                    logging.error("Per-block fallback failed: %s", inner)
+                    results[idx] = text
+                    failed += 1
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Unexpected translation error: %s", exc)
+            for idx, text in zip(misses_idx, misses_text):
+                results[idx] = text
+            failed = len(misses_idx)
+
+    return results, failed
+
+
 def translate_pdf_pages(doc, doc_bytes, start_page, num_pages, translator, text_color, translator_name, target_lang):
     """Translate specific pages of a PDF document with progress and caching"""
     # Log translator information
@@ -194,25 +266,31 @@ def translate_pdf_pages(doc, doc_bytes, start_page, num_pages, translator, text_
             new_doc = pymupdf.open()
             new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
             page = new_doc[0]
-            
-            # Extract and translate text blocks
+
+            # Extract text blocks and translate via batch + block-level cache
             blocks = page.get_text("blocks", flags=pymupdf.TEXT_DEHYPHENATE)
-            
-            for block in blocks:
+            translated_texts, failed = translate_blocks(
+                [b[4] for b in blocks],
+                translator,
+                translator_name,
+                target_lang,
+            )
+            if failed:
+                st.warning(
+                    f"Page {page_num + 1}: {failed} block(s) failed to "
+                    "translate; original text kept."
+                )
+
+            for block, translated in zip(blocks, translated_texts):
                 bbox = block[:4]
-                text = block[4]
-                translated = translator.translate(text)
-                translated = str(translated)  # Ensure the value is a string
-                
-                # Cover original text with white and add translation in color
                 page.draw_rect(bbox, color=None, fill=WHITE)
                 page.insert_htmlbox(
                     bbox,
-                    translated,
+                    str(translated),
                     css=f"* {{font-family: sans-serif; color: rgb({int(rgb_color[0]*255)}, {int(rgb_color[1]*255)}, {int(rgb_color[2]*255)});}}"
                 )
-            
-            # Save to cache
+
+            # Save page-level PDF cache as a secondary cache layer
             save_translation_cache(new_doc, cache_key)
             translated_pages.append(new_doc)
             logging.info(f"Cached new translation for page {page_num + 1}")
