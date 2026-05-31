@@ -17,6 +17,46 @@ from deep_translator.exceptions import ApiKeyException
 # extremely unlikely in natural prose while still being plain ASCII.
 BATCH_DELIMITER = "<<<~PDFXLATE_SEP~>>>"
 
+# Preambles models like to prepend even when told not to.
+_PREAMBLE_RE = re.compile(
+    r"^\s*(sure[,!]?|certainly[,!]?|of course[,!]?|here(?:'s| is)"
+    r"(?: the)?(?: translation| translated text)?[:\-]?\s*"
+    r"|translation[:\-]\s*|translated text[:\-]\s*)",
+    re.IGNORECASE,
+)
+
+# Pairs of surrounding quote characters to strip if they wrap the whole reply.
+_QUOTE_PAIRS = [
+    ('"', '"'),
+    ("'", "'"),
+    ("“", "”"),
+    ("‘", "’"),
+    ("「", "」"),
+    ("『", "』"),
+]
+
+
+def _clean_llm_output(text: str) -> str:
+    """Strip common preambles and balanced surrounding quotes/backticks."""
+    if not text:
+        return text
+    out = text.strip()
+    # Strip preamble layers (e.g. "Sure! Here is the translation:") until
+    # stable, capped to avoid pathological regex loops.
+    for _ in range(5):
+        new = _PREAMBLE_RE.sub("", out).strip()
+        if new == out:
+            break
+        out = new
+    # Strip matched surrounding quotes / triple-backticks.
+    if out.startswith("```") and out.endswith("```") and len(out) >= 6:
+        out = out[3:-3].strip()
+    for left, right in _QUOTE_PAIRS:
+        if len(out) >= 2 and out.startswith(left) and out.endswith(right):
+            out = out[len(left):-len(right)].strip()
+            break
+    return out
+
 
 class ChatGptTranslator(BaseTranslator):
     """
@@ -77,7 +117,7 @@ class ChatGptTranslator(BaseTranslator):
             f"Translate the following text into {self.target}. "
             f"Return only the translation.\n\n{text}"
         )
-        return self._chat(prompt)
+        return _clean_llm_output(self._chat(prompt))
 
     def translate_file(self, path: str, **kwargs) -> str:
         return self._translate_file(path, **kwargs)
@@ -106,4 +146,4 @@ class ChatGptTranslator(BaseTranslator):
         if len(parts) != len(batch):
             # delimiter was lost or duplicated; fall back to per-item
             return [self.translate(t, **kwargs) for t in batch]
-        return parts
+        return [_clean_llm_output(p) for p in parts]

@@ -14,6 +14,7 @@ from deep_translator.openai_compatible import (
 import logging
 import argparse
 import translation_cache
+from pdf_translator import COLOR_MAP, get_blocks, write_translated_page
 
 # Constants
 DEFAULT_PAGES_PER_LOAD = 2
@@ -25,15 +26,6 @@ TRANSLATORS = {
     'OpenAI Compatible': OpenAICompatibleTranslator,
     'OpenAI': OpenAICompatibleTranslator,
     'Google': GoogleTranslator,
-}
-
-# Color options
-COLOR_MAP = {
-    "darkred": (0.8, 0, 0),
-    "black": (0, 0, 0),
-    "blue": (0, 0, 0.8),
-    "darkgreen": (0, 0.5, 0),
-    "purple": (0.5, 0, 0.5),
 }
 
 # Target language options for ChatGPT
@@ -127,12 +119,22 @@ def get_cache_dir():
     return cache_dir
 
 def get_cache_key(doc_info: dict, page_num: int, translator_name: str, target_lang: str, text_content: str):
-    """Generate cache key for a specific page translation"""
-    # 使用文档信息和页面内容的组合生成唯一标识
-    content_hash = hashlib.md5(text_content.encode('utf-8')).hexdigest()[:8]
-    doc_id = f"{doc_info.get('title', '')}_{doc_info.get('author', '')}_{doc_info.get('pagecount', '')}"
-    doc_hash = hashlib.md5(doc_id.encode('utf-8')).hexdigest()[:8]
-    return f"{doc_hash}_{content_hash}_page{page_num}_{translator_name}_{target_lang}.pdf"
+    """Generate cache key for a specific page translation.
+
+    Uses SHA-256 over the full (doc_meta, page, translator, target, content)
+    tuple so collisions across large books are not possible in practice.
+    """
+    payload = "\x1f".join([
+        str(doc_info.get('title', '')),
+        str(doc_info.get('author', '')),
+        str(doc_info.get('pagecount', '')),
+        str(page_num),
+        translator_name,
+        target_lang,
+        text_content,
+    ])
+    digest = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return f"{digest}.pdf"
 
 def get_cached_translation(cache_key: str) -> pymupdf.Document:
     """Get cached translation if exists"""
@@ -224,9 +226,6 @@ def translate_pdf_pages(doc, doc_bytes, start_page, num_pages, translator, text_
     logging.info(f"Using translator: {translator_name}, source: {translator._source}, target: {translator._target}")
     logging.info(f"Selected translator: {translator_name}, Class: {translator.__class__.__name__}")
     
-    WHITE = pymupdf.pdfcolor["white"]
-    rgb_color = COLOR_MAP.get(text_color.lower(), COLOR_MAP["darkred"])
-    
     translated_pages = []
     total_pages = min(start_page + num_pages, doc.page_count) - start_page
     cache_hits = 0
@@ -268,7 +267,7 @@ def translate_pdf_pages(doc, doc_bytes, start_page, num_pages, translator, text_
             page = new_doc[0]
 
             # Extract text blocks and translate via batch + block-level cache
-            blocks = page.get_text("blocks", flags=pymupdf.TEXT_DEHYPHENATE)
+            blocks = get_blocks(page)
             translated_texts, failed = translate_blocks(
                 [b[4] for b in blocks],
                 translator,
@@ -281,14 +280,9 @@ def translate_pdf_pages(doc, doc_bytes, start_page, num_pages, translator, text_
                     "translate; original text kept."
                 )
 
-            for block, translated in zip(blocks, translated_texts):
-                bbox = block[:4]
-                page.draw_rect(bbox, color=None, fill=WHITE)
-                page.insert_htmlbox(
-                    bbox,
-                    str(translated),
-                    css=f"* {{font-family: sans-serif; color: rgb({int(rgb_color[0]*255)}, {int(rgb_color[1]*255)}, {int(rgb_color[2]*255)});}}"
-                )
+            write_translated_page(
+                page, blocks, translated_texts, text_color=text_color
+            )
 
             # Save page-level PDF cache as a secondary cache layer
             save_translation_cache(new_doc, cache_key)
@@ -333,11 +327,7 @@ def translate_all_pages(
     # Log translator information for full document translation
     logging.info(f"Starting full document translation with: {kwargs.get('translator_name', 'unknown')}")
     logging.info(f"Translator settings - source: {translator._source}, target: {translator._target}")
-    
-    # Define colors
-    WHITE = pymupdf.pdfcolor["white"]
-    rgb_color = COLOR_MAP.get(kwargs.get('text_color', 'darkred').lower(), COLOR_MAP["darkred"])
-    
+
     total_pages = input_doc.page_count
     
     # Create a progress bar for overall progress
