@@ -1,4 +1,4 @@
 git+https://github.com/davideuler/pdf-translator-for-human.git
-openai==1.61.0
+openai==2.38.0
 PyMuPDF==1.25.2
-streamlit==1.41.1 
+streamlit==1.58.0
